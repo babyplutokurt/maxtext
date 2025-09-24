@@ -767,6 +767,39 @@ class AttentionOp(nnx.Module):
         need_attend,  # [n_kv_heads, g, q_len, num_block]
     )
 
+  def _generate_moba_mask_single_item(self, q_item, k_item, q_positions):
+    """Generates the token-level MoBA additive mask for a single batch item."""
+    q_len, _, _ = q_item.shape
+    kv_len, _, _ = k_item.shape
+    moba_chunk_size = self.config.moba_chunk_size
+
+    # When kv_len is 0, no blocks are selected. Fallback to a standard causal mask.
+    if kv_len == 0:
+      causal_mask_shape = (q_len, kv_len)
+      k_indices = jax.lax.broadcasted_iota(jnp.int32, causal_mask_shape, 1)
+      q_indices = jax.lax.broadcasted_iota(jnp.int32, causal_mask_shape, 0)
+      causal_mask = q_indices >= k_indices
+      return jnp.where(causal_mask, 0.0, DEFAULT_MASK_VALUE)
+
+    # Run the gating logic to find which key blocks this query cares about.
+    *_, need_attend = self._calculate_moba_gate_logic(q_item, k_item, q_positions)
+
+    # Expand the block-level `need_attend` mask to a token-level mask.
+    k_block_indices = jnp.arange(kv_len, dtype=jnp.int32) // moba_chunk_size
+    token_level_need_attend = need_attend[..., k_block_indices]
+
+    # Convert the boolean mask to float mask values.
+    gate = jnp.where(token_level_need_attend, 0.0, -float("inf"))
+
+    # Apply a final per-token causal mask to ensure causality within chunks.
+    k_indices = jax.lax.broadcasted_iota(jnp.int32, (q_len, kv_len), 1)
+    q_indices = q_positions[:, None]
+    causal_mask = q_indices >= k_indices
+    gate = jnp.where(causal_mask, gate, -float("inf"))
+
+    # Return the additive mask for this batch item.
+    return gate
+
   def _generate_moba_mask(self, query: Array, key: Array, q_positions: Array) -> Array:
     """Builds the token-level MoBA additive mask for the whole batch.
 
@@ -784,42 +817,65 @@ class AttentionOp(nnx.Module):
       `[batch, n_kv_heads, n_q_heads // n_kv_heads, q_len, kv_len]` containing
       `0.` for permitted positions and `-inf` for masked ones.
     """
-
-    def _generate_mask_single_item(q_item, k_item):
-      q_len, _, _ = q_item.shape
-      kv_len, _, _ = k_item.shape
-      moba_chunk_size = self.config.moba_chunk_size
-
-      # When kv_len is 0, no blocks are selected. Fallback to a standard causal mask.
-      if kv_len == 0:
-        causal_mask_shape = (q_len, kv_len)
-        k_indices = jax.lax.broadcasted_iota(jnp.int32, causal_mask_shape, 1)
-        q_indices = jax.lax.broadcasted_iota(jnp.int32, causal_mask_shape, 0)
-        causal_mask = q_indices >= k_indices
-        return jnp.where(causal_mask, 0.0, DEFAULT_MASK_VALUE)
-
-      # Run the gating logic to find which key blocks this query cares about.
-      *_, need_attend = self._calculate_moba_gate_logic(q_item, k_item, q_positions)
-
-      # Expand the block-level `need_attend` mask to a token-level mask.
-      k_block_indices = jnp.arange(kv_len, dtype=jnp.int32) // moba_chunk_size
-      token_level_need_attend = need_attend[..., k_block_indices]
-
-      # Convert the boolean mask to float mask values.
-      gate = jnp.where(token_level_need_attend, 0.0, -float("inf"))
-
-      # Apply a final per-token causal mask to ensure causality within chunks.
-      k_indices = jax.lax.broadcasted_iota(jnp.int32, (q_len, kv_len), 1)
-      q_indices = q_positions[:, None]
-      causal_mask = q_indices >= k_indices
-      gate = jnp.where(causal_mask, gate, -float("inf"))
-
-      # Return the additive mask for this batch item.
-      return gate
-
     # vmap over the batch dimension of query and key. q_positions is constant across the batch.
-    moba_mask = jax.vmap(_generate_mask_single_item)(query, key)
+    moba_mask = jax.vmap(self._generate_moba_mask_single_item, in_axes=(0, 0, None))(query, key, q_positions)
     return moba_mask
+
+  def _moba_flash_attention_single_item(
+    self,
+    query_item: Array, # Shape [num_q_heads, q_len, head_dim]
+    key_item: Array,   # Shape [num_kv_heads, kv_len, head_dim]
+    value_item: Array, # Shape [num_kv_heads, kv_len, head_dim]
+    q_positions: Array # Shape [q_len]
+  ):
+    """Performs MoBA Flash Attention for a single batch item."""
+    q_len = query_item.shape[1]
+    kv_len = key_item.shape[1]
+    num_q_heads = self.num_query_heads
+
+    # The MoBA mask generation expects query and key with shape [l, h, d].
+    q_for_moba = jnp.transpose(query_item, (1, 0, 2))
+    k_for_moba = jnp.transpose(key_item, (1, 0, 2))
+
+    # The gate calculation in MoBA uses the unscaled query.
+    scaling = self.config.head_dim ** (-0.5)
+    unscaled_query = q_for_moba / scaling
+    additive_mask = self._generate_moba_mask_single_item(unscaled_query, k_for_moba, q_positions)
+
+    # Convert additive mask to boolean and reshape for splash attention.
+    boolean_mask = additive_mask > (DEFAULT_MASK_VALUE * 0.5)
+    b, n_kv, g, q_len, kv_len = boolean_mask.shape
+    multi_head_mask = boolean_mask.reshape(b, n_kv * g, q_len, kv_len)
+
+    global global_block_q, global_block_kv, global_block_kv_compute, global_block_q_dkv, global_block_kv_dkv
+    global global_block_kv_dkv_compute, global_block_q_dq, global_block_kv_dq, global_use_fused_bwd_kernel
+    global global_q_layout, global_k_layout, global_v_layout
+
+    block_sizes = splash_attention_kernel.BlockSizes(
+        block_q=min(global_block_q, q_len),
+        block_kv=min(global_block_kv, kv_len),
+        block_kv_compute=min(global_block_kv_compute, kv_len),
+        block_q_dkv=min(global_block_q_dkv, q_len),
+        block_kv_dkv=min(global_block_kv_dkv, kv_len),
+        block_kv_dkv_compute=min(global_block_kv_dkv_compute, kv_len),
+        block_q_dq=None if global_use_fused_bwd_kernel else min(global_block_q_dq, q_len),
+        block_kv_dq=None if global_use_fused_bwd_kernel else min(global_block_kv_dq, kv_len),
+        use_fused_bwd_kernel=global_use_fused_bwd_kernel,
+        q_layout=splash_attention_kernel.QKVLayout[global_q_layout],
+        k_layout=splash_attention_kernel.QKVLayout[global_k_layout],
+        v_layout=splash_attention_kernel.QKVLayout[global_v_layout],
+    )
+
+    splash_kernel = splash_attention_kernel.make_splash_mha(
+        mask=multi_head_mask,
+        head_shards=1,
+        q_seq_shards=1,
+        block_sizes=block_sizes,
+        attn_logits_soft_cap=self.attn_logits_soft_cap,
+        residual_checkpoint_name="context",
+    )
+
+    return splash_kernel(query_item, key_item, value_item)
 
   def apply_attention(
       self,
@@ -1040,6 +1096,28 @@ class AttentionOp(nnx.Module):
       sinks: Array | None = None,
   ) -> Array:
     """TPU Flash Attention."""
+    if hasattr(self.config, "moba_naive") and self.config.moba_naive:
+      # Transpose to ('batch', 'heads', 'length', 'kv')
+      query = jnp.transpose(query, axes=(0, 2, 1, 3))
+      key = jnp.transpose(key, axes=(0, 2, 1, 3))
+      value = jnp.transpose(value, axes=(0, 2, 1, 3))
+
+      # Determine q_positions
+      q_seq_len = query.shape[2]
+      q_positions = jnp.arange(q_seq_len)
+
+      # Vmap the single-item helper over the batch dimension
+      vmapped_moba_flash = jax.vmap(
+          self._moba_flash_attention_single_item,
+          in_axes=(0, 0, 0, None) # vmap over q,k,v; broadcast q_positions
+      )
+
+      # Execute the vmapped function
+      x = vmapped_moba_flash(query, key, value, q_positions)
+
+      # Transpose back to ('batch', 'length', 'heads', 'kv')
+      x = jnp.transpose(x, axes=(0, 2, 1, 3))
+      return x
 
     cp_size = self.config.context_parallel_size
     load_balanced_context_parallel = self.config.context_parallel_load_balance
@@ -1127,22 +1205,11 @@ class AttentionOp(nnx.Module):
           window_size=(self.sliding_window_size, self.sliding_window_size),
           offset=0,
       )
-      # Apply local masking if local sliding attention is enabled.
-      if self.attention_type == AttentionType.LOCAL_SLIDING:
-        if self.sliding_window_size is None:
-          raise ValueError("Sliding_window_size must be set for Local Sliding attention type")
-        mask &= splash_attention_mask.LocalMask(
-            shape=(query.shape[2], key.shape[2]),
-            window_size=(self.sliding_window_size, self.sliding_window_size),
-            offset=0,
-        )
-      elif self.attention_type == AttentionType.CHUNK:
-        if self.chunk_attn_window_size is None:
-          raise ValueError("chunk_attn_window_size must be set for chunk attention type")
+    elif self.attention_type == AttentionType.CHUNK:
+      if self.chunk_attn_window_size is None:
+        raise ValueError("chunk_attn_window_size must be set for chunk attention type")
 
-        mask &= ChunkedCausalMask(shape=(query.shape[2], key.shape[2]), chunk_size=self.chunk_attn_window_size)
-
-    # Create multi-head mask
+      mask &= ChunkedCausalMask(shape=(query.shape[2], key.shape[2]), chunk_size=self.chunk_attn_window_size)
     multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) * query.shape[1])
 
     # Create the splash attention kernel object separately, jit it for performance
